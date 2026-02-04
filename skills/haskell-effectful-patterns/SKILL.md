@@ -1,6 +1,7 @@
 ---
 name: haskell-effectful-patterns
-description: Effectful library usage guide and best practices for building robust Haskell applications with type-safe effect systems.
+description: Effectful library usage guide and best practices for building robust Haskell applications with type-safe effect systems. Use when asked to "design effectful" or work with Haskell effectful patterns.
+argument-hint: <file-or-pattern>
 ---
 
 # Haskell Effectful Patterns
@@ -334,6 +335,134 @@ runWithLogging = interpret $ \env -> \case
     log "Committed transaction"
     pure result
 ```
+
+## Error Handling Patterns
+
+> Source: [effectful discussions #149](https://github.com/haskell-effectful/effectful/discussions/149)
+
+### Pattern 1: Constrained Effect Signatures
+
+When defining effects in effectful, how should operations that can fail be modeled?
+
+Common approaches:
+1. Return `Either` - forces callers to manually handle errors
+2. Add `Error` to the effect's constraint - pollutes all callers with error handling
+
+**Solution: Use constrained effect signatures** by substituting the effect's `m` parameter with `Eff es` and placing `Error` constraints on specific operations:
+
+```haskell
+data FileSystem :: Effect where
+  ReadFile :: Error FsReadError :> es => FilePath -> FileSystem (Eff es) String
+  WriteFile :: Error FsWriteError :> es => FilePath -> String -> FileSystem (Eff es) ()
+```
+
+**Key Insight:** "The caller decides whether to handle, instead of deciding whether to rethrow."
+
+Handler implementation using `localSeqUnlift`:
+
+```haskell
+runFileSystemIO ::
+  (IOE :> es) =>
+  Eff (FileSystem : es) a ->
+  Eff es a
+runFileSystemIO = interpret $ \env -> \case
+  ReadFile path -> do
+    result <- liftIO $ try $ readFile path
+    case result of
+      Left (e :: IOException) ->
+        localSeqUnlift env $ \unlift -> unlift $ throwError $ FsReadError (show e)
+      Right content -> pure content
+```
+
+| Approach | Caller Control | Ergonomics | Effect Scope |
+|----------|---------------|------------|--------------|
+| Return Either | Manual unwrapping | Poor | Clean |
+| Global Error constraint | Forced handling | Medium | Polluted |
+| **Constrained signatures** | Optional handling | Good | Precise |
+
+### Pattern 2: liftEither with Error.Static
+
+`liftEither` from `Control.Monad.Except` requires `MonadError` instance, but `Effectful.Error.Static` does NOT provide this instance. Only `Effectful.Error.Dynamic` does.
+
+**Solution:** Create a local `liftEither` helper:
+
+```haskell
+import Effectful (Eff, (:>))
+import Effectful.Error.Static (Error, throwError)
+
+liftEither :: Error e :> es => Either e a -> Eff es a
+liftEither = either throwError pure
+```
+
+Usage:
+
+```haskell
+import Data.Bifunctor (first)
+
+-- Convert String errors to Text
+result <- liftEither $ first T.pack $ eitherDecode body
+
+-- Convert to custom error type
+result <- liftEither $ first MyError $ parseResult
+```
+
+### Pattern 3: Catching Errors at Boundaries
+
+**runErrorNoCallStack** - Use when you need `Either` at a specific point:
+
+```haskell
+-- Let errors propagate
+items <- fetchRss url
+
+-- Or catch at boundary
+result <- runErrorNoCallStack $ fetchRss url
+case result of
+  Left err -> handleError err
+  Right items -> processItems items
+```
+
+**runErrorWith** - Use for recovery or logging:
+
+```haskell
+runErrorWith handler $ do
+  items <- fetchRss url
+  processItems items
+  where
+    handler _callstack err = do
+      logError err
+      pure defaultValue
+```
+
+### Error Handling Anti-patterns
+
+1. **Don't** add `Error` constraint to the interpreter instead of the effect:
+   ```haskell
+   -- Bad: forces all callers to handle errors
+   runFS :: (Error FsError :> es) => Eff (FileSystem : es) a -> Eff es a
+   ```
+
+2. **Don't** return raw `Either` when errors should propagate:
+   ```haskell
+   -- Bad: forces manual Either handling everywhere
+   data FileSystem :: Effect where
+     ReadFile :: FilePath -> FileSystem m (Either FsError String)
+   ```
+
+3. **Don't** use `Error.Dynamic` just for `liftEither`:
+   ```haskell
+   -- Bad: mixing Static and Dynamic unnecessarily
+   import Effectful.Error.Dynamic (liftEither)
+   ```
+
+### When to Use Each Error Pattern
+
+| Scenario | Pattern |
+|----------|---------|
+| Defining new effects | Constrained signatures |
+| Converting `Either` results | `liftEither` helper |
+| Boundary error handling | `runErrorNoCallStack` |
+| Error recovery/logging | `runErrorWith` |
+| IO exceptions in handlers | `localSeqUnlift` + `throwError` |
 
 ## Best Practices
 
